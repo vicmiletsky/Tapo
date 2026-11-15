@@ -32,9 +32,9 @@ async def test_tapo_code_is_emailed_before_asking_for_it() -> None:
     assert flow._cloud_states == {"kasa": "ok", "tapo": "mfa"}
 
 
-async def test_failure_to_email_the_code_is_reported() -> None:
+async def test_code_is_still_asked_for_if_emailing_it_fails() -> None:
+    """The login itself may already have emailed a code."""
     flow = _flow()
     flow._bridge.tapo.async_send_mfa_code.side_effect = TPLinkCloudError("nope")
-    assert await flow._async_advance() is None
-    assert flow._login_error() == "mfa_send_failed"
-    flow.async_step_mfa.assert_not_called()
+    assert await flow._async_advance() == {"step_id": "mfa"}
+    assert flow._cloud_states == {"kasa": "ok", "tapo": "mfa"}

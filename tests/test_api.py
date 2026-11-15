@@ -483,14 +483,113 @@ async def test_tapo_mfa_code_is_requested_and_verified() -> None:
         },
     )
 
+    fake.calls.clear()
     with pytest.raises(TPLinkAuthError):
         await tapo.async_verify_mfa("user", "password", "000000")
-    await tapo.async_verify_mfa("user", "password", "123456")
+    assert len(fake.calls) == 1  # a wrong code spends a single attempt
 
+    await tapo.async_verify_mfa("user", "password", "123456")
     body = fake.calls[-1][2]
+    # Both known shapes in one request.
     assert body["mfaProcessId"] == "proc-1"
     assert body["terminalBindEnabled"] is True
+    assert body["cloudPassword"] == "password"
+    assert body["terminalUUID"] == "term-id"
     assert (tapo.token, tapo.refresh_token, tapo.mfa_process_id) == ("tok", "ref", None)
+
+
+async def test_mfa_verification_falls_back_on_parameter_errors() -> None:
+    tapo = _cloud()
+    tapo.token = None
+    tapo.mfa_process_id = "proc-1"
+
+    def handler(base_url, url_path, body):
+        if "mfaProcessId" in body:
+            return PARAMETER_MISSING
+        return {"error_code": 0, "result": {"token": "tok"}}
+
+    fake = FakeCloud(tapo, handler)
+    await tapo.async_verify_mfa("user", "password", "123456")
+    assert tapo.token == "tok"
+    assert len(fake.calls) == 2
+    assert "mfaProcessId" not in fake.calls[-1][2]
+
+
+async def test_mfa_verification_reads_nested_errors() -> None:
+    tapo = _cloud()
+    tapo.mfa_process_id = "proc-1"
+    FakeCloud(
+        tapo,
+        lambda *_: {
+            "error_code": 0,
+            "result": {"errorCode": "-20607", "errorMsg": "Incorrect verification code"},
+        },
+    )
+    with pytest.raises(TPLinkAuthError, match="Incorrect verification code"):
+        await tapo.async_verify_mfa("user", "password", "000000")
+
+
+def _login_answer(result: dict) -> Any:
+    def handler(base_url, url_path, body):
+        if url_path == PATH_LOGIN:
+            return {"error_code": 0, "result": result}
+        return {"error_code": 0, "result": {"appServerUrlV2": TAPO_HOST}}
+
+    return handler
+
+
+# The shape TP-Link was seen answering with (values made up): success on
+# the outside, an MFA challenge inside, no token.
+NESTED_MFA_RESULT = {
+    "MFAProcessId": "proc-9",
+    "email": "u***@example.com",
+    "errorCode": "-20677",
+    "errorMsg": "Two-step verification required",
+    "failedAttempts": 0,
+    "lockedMinutes": 0,
+    "mfaEmail": "u***@example.com",
+    "remainAttempts": 5,
+    "supportedMFATypes": [1],
+}
+
+
+@pytest.mark.parametrize("cloud_type", ["kasa", "tapo"])
+async def test_nested_mfa_challenge_is_recognised(cloud_type: str) -> None:
+    cloud = _cloud(cloud_type)
+    cloud.token = None
+    FakeCloud(cloud, _login_answer(NESTED_MFA_RESULT))
+    with pytest.raises(TPLinkMFARequiredError) as err:
+        await cloud.async_login("user", "password")
+    assert err.value.mfa_process_id == "proc-9"
+    assert cloud.mfa_process_id == "proc-9"
+
+
+async def test_nested_mfa_challenge_without_process_id() -> None:
+    kasa = _cloud("kasa")
+    kasa.token = None
+    FakeCloud(kasa, _login_answer({"errorCode": -20677, "errorMsg": "MFA"}))
+    with pytest.raises(TPLinkMFARequiredError):
+        await kasa.async_login("user", "password")
+    assert kasa.mfa_process_id is None
+
+
+async def test_nested_wrong_password_is_an_auth_error() -> None:
+    kasa = _cloud("kasa")
+    kasa.token = None
+    FakeCloud(
+        kasa,
+        _login_answer({"errorCode": "-20601", "errorMsg": "Incorrect email or password"}),
+    )
+    with pytest.raises(TPLinkAuthError, match="Incorrect email or password"):
+        await kasa.async_login("user", "password")
+
+
+async def test_tokenless_login_reports_the_fields_it_got() -> None:
+    kasa = _cloud("kasa")
+    kasa.token = None
+    FakeCloud(kasa, _login_answer({"accountId": "1", "email": "x"}))
+    with pytest.raises(TPLinkCloudError, match=r"fields \['accountId', 'email'\]"):
+        await kasa.async_login("user", "password")
 
 
 async def test_legacy_mfa_challenge_is_unchanged() -> None:

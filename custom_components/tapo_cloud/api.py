@@ -213,6 +213,17 @@ def _raise_for_error(envelope: dict[str, Any], action: str) -> None:
     raise TPLinkCloudError(message, error_code=error_code)
 
 
+def _inner_error_code(result: dict[str, Any]) -> int | None:
+    """errorCode nested in a result (an int, or a string such as "-20677")."""
+    value = result.get("errorCode")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _ordered(modes: tuple[str, ...], preferred: str | None) -> list[str]:
     """Modes with the one known to work first."""
     ordered = list(modes)
@@ -387,10 +398,11 @@ class TPLinkCloud:
         self._handle_login_result(envelope)
 
     async def async_send_mfa_code(self, username: str, password: str) -> None:
-        """Ask TP-Link to email the code for a pending MFA process.
+        """Ask TP-Link to email the code for a pending terminal-MFA process.
 
-        Only needed when login answered with an mfaProcessId; the older
-        -20677 challenge sends its code by itself.
+        This is what the Tapo app does for a login that answered with an
+        MFA process id. The login itself may already have emailed a code,
+        so callers should treat a failure here as non-fatal.
         """
         if not self.mfa_process_id:
             return
@@ -407,11 +419,25 @@ class TPLinkCloud:
         _raise_for_error(envelope, "Sending the verification code")
 
     async def async_verify_mfa(self, username: str, password: str, code: str) -> None:
-        """Complete a login challenged with MFA."""
+        """Complete a login challenged with MFA.
+
+        Two request shapes are known: the original checkMFACodeAndLogin
+        body (password + terminal id) and the Tapo app's terminal-MFA body
+        (process id, binding this terminal so it is not asked again). With
+        a process id, both are sent together first; the separate shapes
+        are only tried if the cloud reports a missing/unknown parameter,
+        so a wrong code never spends more than one attempt.
+        """
+        legacy: dict[str, Any] = {
+            "appType": self._app_type,
+            "cloudPassword": password,
+            "cloudUserName": username,
+            "code": code,
+            "terminalUUID": self._term_id,
+        }
+        bodies = [legacy]
         if self.mfa_process_id:
-            # The Tapo app's terminal-MFA check; binding the terminal keeps
-            # later logins from this installation from asking again.
-            body: dict[str, Any] = {
+            terminal: dict[str, Any] = {
                 "appType": self._app_type,
                 "cloudUserName": username,
                 "code": code,
@@ -420,26 +446,37 @@ class TPLinkCloud:
                 "terminalBindEnabled": True,
                 "supportBindAccount": False,
             }
-        else:
-            body = {
-                "appType": self._app_type,
-                "cloudPassword": password,
-                "cloudUserName": username,
-                "code": code,
-                "terminalUUID": self._term_id,
-            }
-        envelope = await self._post(self.host, PATH_MFA_LOGIN, body, with_token=False)
-        error_code = envelope.get("error_code")
-        if error_code != 0:
-            raise TPLinkAuthError(
-                envelope.get("msg") or f"MFA verification failed ({error_code})",
-                error_code=error_code,
+            bodies = [{**legacy, **terminal}, legacy, terminal]
+
+        failures: list[str] = []
+        for body in bodies:
+            envelope = await self._post(
+                self.host, PATH_MFA_LOGIN, body, with_token=False
             )
-        result = envelope.get("result") or {}
-        if not result.get("token"):
-            raise TPLinkCloudError("MFA verification returned no token")
-        self.mfa_process_id = None
-        self._store_tokens(result)
+            error_code = envelope.get("error_code")
+            result = envelope.get("result") or {}
+            inner_code = _inner_error_code(result)
+            if error_code == 0 and result.get("token"):
+                self.mfa_process_id = None
+                self._store_tokens(result)
+                return
+            code_seen = error_code if error_code != 0 else inner_code
+            message = (
+                envelope.get("msg")
+                or result.get("errorMsg")
+                or "MFA verification failed"
+            )
+            if code_seen in _UNSUPPORTED_REQUEST_ERRORS:
+                failures.append(f"{message} ({code_seen})")
+                continue
+            if code_seen:
+                raise TPLinkAuthError(f"{message} ({code_seen})", error_code=code_seen)
+            raise TPLinkCloudError(
+                f"MFA verification returned no token (fields {sorted(result)})"
+            )
+        raise TPLinkCloudError(
+            "TP-Link rejected every verification request: " + "; ".join(failures)
+        )
 
     def _handle_login_result(self, envelope: dict[str, Any]) -> None:
         error_code = envelope.get("error_code")
@@ -455,20 +492,44 @@ class TPLinkCloud:
                 self.mfa_process_id = None
                 self._store_tokens(result)
                 return
-            if result.get("mfaProcessId"):
-                # Not a failure code, but no token either: every request
-                # sent without one is answered with -20104 "Parameter
-                # doesn't exist" (Tapo #1).
-                self.mfa_process_id = result["mfaProcessId"]
+            # The login can succeed on the outside and fail inside the
+            # result: {"errorCode": "-20677", "errorMsg": ..., "MFAProcessId":
+            # ...} with no token. Taking that as success left the token
+            # empty, and every later request was answered with -20104
+            # "Parameter doesn't exist" (Tapo #1).
+            inner_code = _inner_error_code(result)
+            message = result.get("errorMsg") or envelope.get("msg")
+            if inner_code in (ERR_WRONG_CREDENTIALS, ERR_ACCOUNT_LOCKED):
+                raise TPLinkAuthError(
+                    f"{message or 'Authentication failed'} ({inner_code})",
+                    error_code=inner_code,
+                )
+            process_id = result.get("mfaProcessId") or result.get("MFAProcessId")
+            if process_id or inner_code == ERR_MFA_REQUIRED:
+                self.mfa_process_id = process_id
                 raise TPLinkMFARequiredError(
                     f"{self.cloud_type} cloud needs an emailed verification code",
                     mfa_type=result.get("mfaType"),
-                    mfa_process_id=self.mfa_process_id,
+                    mfa_process_id=process_id,
                 )
-            raise TPLinkCloudError(f"{self.cloud_type} cloud login returned no token")
+            if inner_code:
+                raise TPLinkCloudError(
+                    f"{self.cloud_type} cloud login failed: "
+                    f"{message or 'error'} ({inner_code})",
+                    error_code=inner_code,
+                )
+            raise TPLinkCloudError(
+                f"{self.cloud_type} cloud login returned no token "
+                f"(fields {sorted(result)})"
+            )
         if error_code == ERR_MFA_REQUIRED:
+            self.mfa_process_id = result.get("mfaProcessId") or result.get(
+                "MFAProcessId"
+            )
             raise TPLinkMFARequiredError(
-                "MFA verification required", mfa_type=result.get("mfaType")
+                "MFA verification required",
+                mfa_type=result.get("mfaType"),
+                mfa_process_id=self.mfa_process_id,
             )
         if error_code in (ERR_WRONG_CREDENTIALS, ERR_ACCOUNT_LOCKED):
             raise TPLinkAuthError(

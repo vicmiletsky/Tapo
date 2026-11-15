@@ -11,7 +11,7 @@
       },
       "mfa": {
         "title": "Verification code required",
-        "description": "TP-Link sent a verification code to {username} for the {cloud} cloud. Enter it below.",
+        "description": "TP-Link emailed a verification code to {username} for the {cloud} cloud. If more than one arrived, use the newest. Enter it below.",
         "data": {
           "code": "Verification code"
         }
@@ -20,8 +20,7 @@
     "error": {
       "invalid_auth": "Invalid email or password",
       "invalid_mfa_code": "Invalid verification code",
-      "cannot_connect": "Could not reach the TP-Link cloud",
-      "mfa_send_failed": "TP-Link could not send a verification code. Try signing in again."
+      "cannot_connect": "Could not reach the TP-Link cloud"
     },
     "abort": {
       "already_configured": "This TP-Link account is already configured",

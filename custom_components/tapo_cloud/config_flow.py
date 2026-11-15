@@ -65,7 +65,6 @@ class TapoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
         self._cloud_states: dict[str, str] = {}
         self._mfa_cloud: str | None = None
         self._reauth_entry: ConfigEntry | None = None
-        self._error: str | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -86,7 +85,6 @@ class TapoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
 
             await self._async_create_bridge()
             self._cloud_states = {"kasa": _PENDING, "tapo": _PENDING}
-            self._error = None
             result = await self._async_advance()
             if result is not None:
                 return result
@@ -173,13 +171,12 @@ class TapoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
                 try:
                     await cloud.async_send_mfa_code(self._username, self._password)
                 except TPLinkCloudError as err:
-                    _LOGGER.warning(
-                        "%s cloud could not send a verification code: %s",
+                    # The login may already have emailed a code.
+                    _LOGGER.debug(
+                        "%s cloud did not accept the request to email a code: %s",
                         cloud_type,
                         err,
                     )
-                    self._error = "mfa_send_failed"
-                    return None
                 self._cloud_states[cloud_type] = _NEEDS_MFA
                 self._mfa_cloud = cloud_type
                 return await self.async_step_mfa()
@@ -194,8 +191,6 @@ class TapoCloudConfigFlow(ConfigFlow, domain=DOMAIN):
         return self._finish()
 
     def _login_error(self) -> str:
-        if self._error:
-            return self._error
         states = set(self._cloud_states.values())
         if _AUTH_FAILED in states:
             return "invalid_auth"
