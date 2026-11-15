@@ -1,5 +1,5 @@
 {
-  "name": "VM Tapo Cloud Bridge",
+  "name": "VM Tapo Cloud",
   "render_readme": true,
   "homeassistant": "2024.12.0"
 }

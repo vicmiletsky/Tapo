@@ -1,4 +1,4 @@
-"""Config flow for VM Tapo Cloud Bridge."""
+"""Config flow for VM Tapo Cloud."""
 from __future__ import annotations
 
 import logging

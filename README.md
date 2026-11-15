@@ -1,4 +1,4 @@
-# VM Tapo Cloud Bridge for Home Assistant
+# VM Tapo Cloud for Home Assistant
 
 A [HACS](https://hacs.xyz) custom integration that controls **TP-Link Tapo and Kasa devices through TP-Link's cloud** — the same channel the official apps use.
 
@@ -55,7 +55,7 @@ This gives you a live inventory of which devices the TPAP rollout has claimed so
 
 1. In HACS, open **⋮ → Custom repositories**.
 2. Add `https://github.com/vicmiletsky/Tapo` with category **Integration**.
-3. Install **VM Tapo Cloud Bridge** and restart Home Assistant.
+3. Install **VM Tapo Cloud** and restart Home Assistant.
 
 ### Manual
 
@@ -63,7 +63,7 @@ Copy `custom_components/tapo_cloud` into your Home Assistant `config/custom_comp
 
 ## Setup
 
-1. Go to **Settings → Devices & Services → Add Integration** and search for **VM Tapo Cloud Bridge**.
+1. Go to **Settings → Devices & Services → Add Integration** and search for **VM Tapo Cloud**.
 2. Sign in with your TP-Link account (the one you use in the Tapo/Kasa app).
 3. If your account has two-step verification, you'll be prompted for the code TP-Link emails you — once per cloud (Kasa and Tapo are separate clouds behind the same account).
 

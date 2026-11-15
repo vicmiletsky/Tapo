@@ -1,4 +1,4 @@
-"""VM Tapo Cloud Bridge.
+"""VM Tapo Cloud.
 
 Controls TP-Link Tapo and Kasa devices through TP-Link's cloud — the
 same channel the official apps use — so devices keep working in Home

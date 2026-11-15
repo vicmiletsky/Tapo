@@ -1,4 +1,4 @@
-"""Diagnostics support for VM Tapo Cloud Bridge."""
+"""Diagnostics support for VM Tapo Cloud."""
 from __future__ import annotations
 
 from typing import Any

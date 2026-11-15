@@ -1,4 +1,4 @@
-"""Base entity for VM Tapo Cloud Bridge."""
+"""Base entity for VM Tapo Cloud."""
 from __future__ import annotations
 
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo

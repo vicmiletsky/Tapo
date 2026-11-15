@@ -100,20 +100,25 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TapoCloudCoordinator = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
+    known: set[tuple[str, str]] = set()
 
     @callback
     def _sync_entities() -> None:
+        # Per reading, not per device: a plug that is offline at startup, or
+        # whose first reply lacks some readings, gains the missing sensors
+        # as soon as they show up.
         new_entities: list[SensorEntity] = []
         for device_id, device in (coordinator.data or {}).items():
-            if device_id in known or not device.emeter_supported or not device.emeter:
+            if not device.emeter_supported or not device.emeter:
                 continue
-            known.add(device_id)
-            new_entities.extend(
-                TapoCloudSensor(coordinator, device_id, description)
-                for description in SENSOR_DESCRIPTIONS
-                if description.emeter_key in device.emeter
-            )
+            for description in SENSOR_DESCRIPTIONS:
+                key = (device_id, description.key)
+                if key in known or description.emeter_key not in device.emeter:
+                    continue
+                known.add(key)
+                new_entities.append(
+                    TapoCloudSensor(coordinator, device_id, description)
+                )
         if new_entities:
             async_add_entities(new_entities)
 
