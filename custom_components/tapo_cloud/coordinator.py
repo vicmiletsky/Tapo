@@ -3,20 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
     TPLinkAuthError,
     TPLinkCloudBridge,
     TPLinkCloudError,
+    TPLinkDeviceOfflineError,
     TPLinkMFARequiredError,
+    TPLinkUnsupportedRequestError,
 )
 from .discovery import LocalInfo, async_probe_local, normalize_mac
 from .const import (
@@ -30,13 +33,35 @@ from .const import (
     EMETER_MODEL_PREFIXES,
     EVENT_DEVICE_OFFLINE,
     EVENT_DEVICE_ONLINE,
+    LIGHT_DEVICE_TYPES,
     STATUS_ONLINE,
+    SWITCH_DEVICE_TYPES,
+)
+from .smart import (
+    PROTOCOL_IOT,
+    PROTOCOL_SMART,
+    SMART_ENERGY_REQUEST,
+    SMART_INFO_REQUEST,
+    SmartDeviceError,
+    UnsupportedCommandError,
+    device_alias,
+    iot_request_to_smart,
+    is_smart_device_type,
+    smart_energy_to_emeter,
+    smart_info_to_sysinfo,
+    smart_result,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 # Limit concurrent cloud requests per refresh cycle.
 _MAX_CONCURRENCY = 6
+
+# A controllable device the device list reports as not online is still
+# asked for its state (the list's status is not always right, e.g. for
+# Tapo devices only listed by the Kasa cloud); after a failed attempt,
+# wait this long before asking again.
+OFFLINE_PROBE_BACKOFF = 300
 
 SYSINFO_REQUEST = {"system": {"get_sysinfo": None}}
 EMETER_REQUEST = {"emeter": {"get_realtime": {}}}
@@ -51,6 +76,10 @@ class CloudDevice:
     emeter: dict[str, Any] | None = None
     emeter_supported: bool | None = None
     local: LocalInfo | None = None
+    # "iot" or "smart", once a state request has succeeded.
+    protocol: str | None = None
+    # True when the device answered a request this refresh.
+    reachable: bool = False
 
     @property
     def device_id(self) -> str:
@@ -61,7 +90,11 @@ class CloudDevice:
         # Device-list alias can lag behind; sysinfo alias is authoritative.
         if self.sysinfo and self.sysinfo.get("alias"):
             return self.sysinfo["alias"]
-        return self.info.get("alias") or self.info.get("deviceName") or self.device_id
+        return (
+            device_alias(self.info.get("alias"), self.device_type)
+            or self.info.get("deviceName")
+            or self.device_id
+        )
 
     @property
     def model(self) -> str:
@@ -73,7 +106,7 @@ class CloudDevice:
 
     @property
     def online(self) -> bool:
-        return self.info.get("status") == STATUS_ONLINE
+        return self.info.get("status") == STATUS_ONLINE or self.reachable
 
     @property
     def children(self) -> list[dict[str, Any]]:
@@ -122,6 +155,8 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         self.entry = entry
         self.bridge = bridge
         self._emeter_support: dict[str, bool] = {}
+        self._protocols: dict[str, str] = {}
+        self._probe_after: dict[str, float] = {}
 
     async def _async_update_data(self) -> dict[str, CloudDevice]:
         probe_enabled = self.entry.options.get(CONF_LOCAL_PROBE, DEFAULT_LOCAL_PROBE)
@@ -148,7 +183,9 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
         async def fetch_state(device: CloudDevice) -> None:
-            if not device.online:
+            if not device.online and not (
+                _is_controllable(device) and self._probe_due(device.device_id)
+            ):
                 _LOGGER.debug(
                     "Skipping %s (%s): cloud reports status %r, not online",
                     device.alias,
@@ -157,20 +194,32 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
                 )
                 return
             async with semaphore:
+                listed_online = device.online
                 try:
-                    response = await self.bridge.async_device_request(
-                        device.info, SYSINFO_REQUEST
-                    )
+                    await self._async_fetch_sysinfo(device)
                 except TPLinkCloudError as err:
                     _LOGGER.debug(
-                        "get_sysinfo failed for %s (%s): %s",
+                        "State request failed for %s (%s, status %r): %s",
                         device.alias,
                         device.model,
+                        device.info.get("status"),
                         err,
                     )
+                    if not listed_online:
+                        self._probe_after[device.device_id] = (
+                            time.monotonic() + OFFLINE_PROBE_BACKOFF
+                        )
                     return
-                if response:
-                    device.sysinfo = (response.get("system") or {}).get("get_sysinfo")
+                if device.sysinfo is not None:
+                    device.reachable = True
+                    self._probe_after.pop(device.device_id, None)
+                    if not listed_online:
+                        _LOGGER.debug(
+                            "%s (%s) answered although the cloud lists status %r",
+                            device.alias,
+                            device.model,
+                            device.info.get("status"),
+                        )
                 await self._async_fetch_emeter(device)
 
         await asyncio.gather(*(fetch_state(device) for device in devices.values()))
@@ -189,6 +238,62 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         self._persist_refresh_tokens()
         return devices
 
+    def _probe_due(self, device_id: str) -> bool:
+        return time.monotonic() >= self._probe_after.get(device_id, 0.0)
+
+    async def _async_fetch_sysinfo(self, device: CloudDevice) -> None:
+        """Fetch device state, in the device's own protocol.
+
+        SMART-family devices get get_device_info first and fall back to the
+        IOT get_sysinfo; whichever answers is remembered for the device.
+        """
+        device_id = device.device_id
+        if is_smart_device_type(device.device_type):
+            protocols = [PROTOCOL_SMART, PROTOCOL_IOT]
+            known = self._protocols.get(device_id)
+            if known in protocols:
+                protocols.remove(known)
+                protocols.insert(0, known)
+        else:
+            protocols = [PROTOCOL_IOT]
+
+        first_error: Exception | None = None
+        for protocol in protocols:
+            try:
+                if protocol == PROTOCOL_SMART:
+                    response = await self.bridge.async_device_request(
+                        device.info, SMART_INFO_REQUEST
+                    )
+                    sysinfo = smart_info_to_sysinfo(smart_result(response))
+                else:
+                    response = await self.bridge.async_device_request(
+                        device.info, SYSINFO_REQUEST
+                    )
+                    sysinfo = ((response or {}).get("system") or {}).get(
+                        "get_sysinfo"
+                    )
+                    if len(protocols) > 1 and not isinstance(sysinfo, dict):
+                        raise SmartDeviceError("no get_sysinfo in response")
+            except (
+                TPLinkAuthError,
+                TPLinkMFARequiredError,
+                TPLinkDeviceOfflineError,
+                TPLinkUnsupportedRequestError,
+            ):
+                # Cloud-level failures: the other protocol would hit the same.
+                raise
+            except (TPLinkCloudError, SmartDeviceError) as err:
+                first_error = first_error or err
+                continue
+            device.sysinfo = sysinfo
+            device.protocol = protocol
+            self._protocols[device_id] = protocol
+            return
+
+        if isinstance(first_error, TPLinkCloudError):
+            raise first_error
+        raise TPLinkCloudError(f"No usable state response: {first_error}")
+
     async def _async_fetch_emeter(self, device: CloudDevice) -> None:
         """Fetch energy readings for devices that support them.
 
@@ -205,15 +310,28 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         if not supported:
             device.emeter_supported = False
             return
-        try:
-            response = await self.bridge.async_device_request(
-                device.info, EMETER_REQUEST
-            )
-        except TPLinkCloudError:
-            response = None
-        realtime = ((response or {}).get("emeter") or {}).get("get_realtime")
-        if realtime and realtime.get("err_code", 0) == 0:
-            device.emeter = _normalize_emeter(realtime)
+        if device.protocol == PROTOCOL_SMART:
+            try:
+                response = await self.bridge.async_device_request(
+                    device.info, SMART_ENERGY_REQUEST
+                )
+                realtime = smart_energy_to_emeter(smart_result(response)) or None
+            except (TPLinkCloudError, SmartDeviceError):
+                realtime = None
+        else:
+            try:
+                response = await self.bridge.async_device_request(
+                    device.info, EMETER_REQUEST
+                )
+            except TPLinkCloudError:
+                response = None
+            realtime = ((response or {}).get("emeter") or {}).get("get_realtime")
+            if realtime and realtime.get("err_code", 0) == 0:
+                realtime = _normalize_emeter(realtime)
+            else:
+                realtime = None
+        if realtime is not None:
+            device.emeter = realtime
             device.emeter_supported = True
             self._emeter_support[device_id] = True
         elif self._emeter_support.get(device_id):
@@ -273,10 +391,35 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         device = (self.data or {}).get(device_id)
         if device is None:
             raise UpdateFailed(f"Unknown device {device_id}")
+        smart = device.protocol == PROTOCOL_SMART
+        if smart:
+            try:
+                request_data = iot_request_to_smart(request_data)
+            except UnsupportedCommandError as err:
+                raise HomeAssistantError(
+                    f"{device.alias} does not support this command: {err}"
+                ) from err
         try:
             response = await self.bridge.async_device_request(
                 device.info, request_data
             )
         except (TPLinkAuthError, TPLinkMFARequiredError) as err:
             raise ConfigEntryAuthFailed(str(err)) from err
+        except TPLinkCloudError as err:
+            raise HomeAssistantError(
+                f"Command to {device.alias} failed: {err}"
+            ) from err
+        if smart:
+            try:
+                smart_result(response)
+            except SmartDeviceError as err:
+                raise HomeAssistantError(
+                    f"{device.alias} rejected the command: {err}"
+                ) from err
         return response
+
+
+def _is_controllable(device: CloudDevice) -> bool:
+    return device.device_type in SWITCH_DEVICE_TYPES or (
+        device.device_type in LIGHT_DEVICE_TYPES
+    )

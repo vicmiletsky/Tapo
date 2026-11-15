@@ -13,6 +13,21 @@ Because commands travel device->cloud, control keeps working even when
 the device's local API is unreachable — e.g. after a firmware update
 switched the device to the (still unsupported) TPAP local protocol.
 
+The Tapo cloud differs from the Kasa cloud in a few ways that matter
+(HallyAus/Tapo#1):
+
+  * getAccountStatusAndUrl returns the V2 app server as appServerUrlV2;
+    the legacy appServerUrl does not serve every V2 path.
+  * The Tapo app lists devices with POST /api/v2/common/getDeviceListByPage
+    (deviceTypeList + index/limit paging). The Kasa-style
+    {"method": "getDeviceList"} is rejected with -20104 by some accounts.
+  * Passthrough goes to /api/v2/common/passthrough with requestData as a
+    JSON object.
+
+Because none of this is officially documented, every Tapo request shape
+is tried in order of preference, and the one the cloud accepts is
+remembered.
+
 Protocol details derived from the GPL-3.0 project
 https://github.com/piekstra/tplink-cloud-api
 """
@@ -55,12 +70,83 @@ PATH_LOGIN = "/api/v2/account/login"
 PATH_REFRESH = "/api/v2/account/refreshToken"
 PATH_MFA_LOGIN = "/api/v2/account/checkMFACodeAndLogin"
 PATH_TAPO_PASSTHROUGH = "/api/v2/common/passthrough"
+PATH_TAPO_DEVICE_LIST = "/api/v2/common/getDeviceListByPage"
 
 ERR_MFA_REQUIRED = -20677
 ERR_TOKEN_EXPIRED = -20651
 ERR_REFRESH_TOKEN_EXPIRED = -20655
 ERR_WRONG_CREDENTIALS = -20601
 ERR_ACCOUNT_LOCKED = -20675
+# Outside of login, the Tapo app treats -20675 as an invalid token.
+ERR_TOKEN_INVALID = -20675
+ERR_METHOD_NOT_FOUND = -20103
+ERR_PARAMETER_NOT_FOUND = -20104
+ERR_DEVICE_OFFLINE = -20571
+# Device-level SMART protocol error: the relayed requestData was not JSON
+# the device could parse.
+ERR_DEVICE_MALFORMED_REQUEST = -1003
+
+_TOKEN_ERRORS = {ERR_TOKEN_EXPIRED, ERR_TOKEN_INVALID}
+# The cloud answers these when it does not know a method or misses a
+# parameter, i.e. when we used a request shape this server does not serve.
+_UNSUPPORTED_REQUEST_ERRORS = {ERR_METHOD_NOT_FOUND, ERR_PARAMETER_NOT_FOUND}
+_UNSUPPORTED_HTTP_STATUSES = {404, 405}
+
+# Cloud device-list "status" value for a device connected to the cloud.
+_STATUS_ONLINE = 1
+
+# deviceType values requested from the Tapo cloud's paged device list.
+TAPO_LIST_DEVICE_TYPES = (
+    "SMART.TAPOPLUG",
+    "SMART.TAPOBULB",
+    "SMART.TAPOSWITCH",
+    "SMART.TAPOHUB",
+    "SMART.TAPOROBOVAC",
+    "SMART.TAPOCHIME",
+    "SMART.TAPODOORBELL",
+    "SMART.IPCAMERA",
+    "SMART.KASAPLUG",
+    "SMART.KASASWITCH",
+    "SMART.KASAHUB",
+    "IOT.SMARTPLUGSWITCH",
+    "IOT.SMARTBULB",
+    "IOT.IPCAMERA",
+    "IOT.RANGEEXTENDER.SMARTPLUG",
+)
+# Fallback list of the controllable Tapo types, in case the cloud rejects
+# a type it does not know.
+TAPO_LIST_BASIC_DEVICE_TYPES = (
+    "SMART.TAPOPLUG",
+    "SMART.TAPOBULB",
+    "SMART.TAPOSWITCH",
+)
+DEVICE_LIST_PAGE_SIZE = 20
+_MAX_DEVICE_LIST_PAGES = 50
+
+# Tapo device-list request shapes, in order of preference.
+DEVICE_LIST_PAGED = "paged"
+DEVICE_LIST_PAGED_BASIC = "paged_basic"
+DEVICE_LIST_LEGACY = "legacy"
+_TAPO_DEVICE_LIST_MODES = (
+    DEVICE_LIST_PAGED,
+    DEVICE_LIST_PAGED_BASIC,
+    DEVICE_LIST_LEGACY,
+)
+
+# Tapo passthrough request shapes, in order of preference.
+PASSTHROUGH_V2_OBJECT = "v2_object"
+PASSTHROUGH_V2_STRING = "v2_string"
+PASSTHROUGH_V1_OBJECT = "v1_object"
+_TAPO_PASSTHROUGH_MODES = (
+    PASSTHROUGH_V2_OBJECT,
+    PASSTHROUGH_V2_STRING,
+    PASSTHROUGH_V1_OBJECT,
+)
+
+# Device types served by the Tapo cloud rather than the Kasa cloud. The
+# Kasa cloud lists these too, but reports them offline (status 0) because
+# they never connect to its relay.
+TAPO_FAMILY_TYPE_PREFIXES = ("SMART.TAPO", "SMART.IPCAMERA")
 
 _CA_CHAIN = Path(__file__).parent / "certs" / "tplink-ca-chain.pem"
 
@@ -89,6 +175,44 @@ class TPLinkMFARequiredError(TPLinkCloudError):
 
 class TPLinkTokenExpiredError(TPLinkCloudError):
     """Auth or refresh token has expired."""
+
+
+class TPLinkUnsupportedRequestError(TPLinkCloudError):
+    """The cloud does not serve this request shape (unknown method/parameter)."""
+
+
+class TPLinkDeviceOfflineError(TPLinkCloudError):
+    """The cloud has no connection to the device."""
+
+
+def is_tapo_family(device: dict[str, Any]) -> bool:
+    """Whether a device-list entry belongs on the Tapo cloud."""
+    device_type = (device.get("deviceType") or "").upper()
+    return device_type.startswith(TAPO_FAMILY_TYPE_PREFIXES)
+
+
+def _raise_for_error(envelope: dict[str, Any], action: str) -> None:
+    """Raise the matching error for a non-zero cloud error_code."""
+    error_code = envelope.get("error_code")
+    if error_code == 0:
+        return
+    message = f"{action} failed: {envelope.get('msg') or 'error'} ({error_code})"
+    if error_code in _TOKEN_ERRORS:
+        raise TPLinkTokenExpiredError(message, error_code=error_code)
+    if error_code in _UNSUPPORTED_REQUEST_ERRORS:
+        raise TPLinkUnsupportedRequestError(message, error_code=error_code)
+    if error_code == ERR_DEVICE_OFFLINE:
+        raise TPLinkDeviceOfflineError(message, error_code=error_code)
+    raise TPLinkCloudError(message, error_code=error_code)
+
+
+def _ordered(modes: tuple[str, ...], preferred: str | None) -> list[str]:
+    """Modes with the one known to work first."""
+    ordered = list(modes)
+    if preferred in ordered:
+        ordered.remove(preferred)
+        ordered.insert(0, preferred)
+    return ordered
 
 
 def build_ssl_context() -> ssl.SSLContext:
@@ -141,15 +265,19 @@ class TPLinkCloud:
             self._access_key = TAPO_ACCESS_KEY
             self._secret_key = TAPO_SECRET_KEY
             self._app_type = TAPO_APP_TYPE
-            self.host = TAPO_HOST
+            self._default_host = TAPO_HOST
         else:
             self._access_key = KASA_ACCESS_KEY
             self._secret_key = KASA_SECRET_KEY
             self._app_type = KASA_APP_TYPE
-            self.host = KASA_HOST
+            self._default_host = KASA_HOST
+        self.host = self._default_host
 
         self.token: str | None = None
         self.refresh_token: str | None = None
+        # Request shapes this cloud accepted (Tapo only).
+        self.device_list_mode: str | None = None
+        self.passthrough_mode: str | None = None
 
         self._query_params = {
             "appName": self._app_type,
@@ -194,6 +322,10 @@ class TPLinkCloud:
                 ssl=self._ssl,
                 timeout=REQUEST_TIMEOUT,
             ) as response:
+                if response.status in _UNSUPPORTED_HTTP_STATUSES:
+                    raise TPLinkUnsupportedRequestError(
+                        f"HTTP {response.status} from {url_path}: {response.reason}"
+                    )
                 if response.status != 200:
                     raise TPLinkCloudError(
                         f"HTTP {response.status} from {url_path}: {response.reason}"
@@ -203,11 +335,24 @@ class TPLinkCloud:
             raise TPLinkCloudError(f"Connection error calling {url_path}: {err}") from err
 
     async def _get_regional_url(self, username: str) -> str:
+        # Asked of the global endpoint, like the apps do: self.host may
+        # already be a (possibly stale) regional server.
         body = {"appType": self._app_type, "cloudUserName": username}
-        envelope = await self._post(self.host, PATH_ACCOUNT_STATUS, body, with_token=False)
-        if envelope.get("error_code") == 0:
-            return (envelope.get("result") or {}).get("appServerUrl", self.host)
-        return self.host
+        envelope = await self._post(
+            self._default_host, PATH_ACCOUNT_STATUS, body, with_token=False
+        )
+        if envelope.get("error_code") != 0:
+            return self.host
+        result = envelope.get("result") or {}
+        if self.cloud_type == "tapo" and result.get("appServerUrlV2"):
+            # The current Tapo app talks to the V2 server; the legacy
+            # appServerUrl does not serve every /api/v2 path.
+            return result["appServerUrlV2"]
+        return result.get("appServerUrl") or self.host
+
+    async def async_lookup_host(self, username: str) -> str:
+        """Return the regional app server the cloud assigns to this account."""
+        return await self._get_regional_url(username)
 
     async def async_login(self, username: str, password: str) -> None:
         """Log in with account credentials.
@@ -297,29 +442,81 @@ class TPLinkCloud:
 
     async def async_get_device_list(self) -> list[dict[str, Any]]:
         """Return the raw device list registered to this cloud."""
-        envelope = await self._post(self.host, "/", {"method": "getDeviceList"})
-        error_code = envelope.get("error_code")
-        if error_code == 0:
-            return (envelope.get("result") or {}).get("deviceList", [])
-        if error_code == ERR_TOKEN_EXPIRED:
-            raise TPLinkTokenExpiredError("Auth token expired", error_code=error_code)
-        raise TPLinkCloudError(
-            envelope.get("msg") or f"getDeviceList failed ({error_code})",
-            error_code=error_code,
+        if self.cloud_type != "tapo":
+            return await self._async_get_legacy_device_list()
+
+        failures: list[str] = []
+        for mode in _ordered(_TAPO_DEVICE_LIST_MODES, self.device_list_mode):
+            try:
+                if mode == DEVICE_LIST_LEGACY:
+                    devices = await self._async_get_legacy_device_list()
+                elif mode == DEVICE_LIST_PAGED_BASIC:
+                    devices = await self._async_get_paged_device_list(
+                        TAPO_LIST_BASIC_DEVICE_TYPES
+                    )
+                else:
+                    devices = await self._async_get_paged_device_list(
+                        TAPO_LIST_DEVICE_TYPES
+                    )
+            except TPLinkUnsupportedRequestError as err:
+                failures.append(f"{mode}: {err}")
+                continue
+            if mode != self.device_list_mode:
+                _LOGGER.debug("Tapo cloud accepted the %s device-list request", mode)
+                self.device_list_mode = mode
+            return devices
+        raise TPLinkUnsupportedRequestError(
+            "Tapo cloud rejected every device-list request ("
+            + "; ".join(failures)
+            + ")"
         )
+
+    async def _async_get_legacy_device_list(self) -> list[dict[str, Any]]:
+        """Kasa-style V1 getDeviceList on the root path."""
+        envelope = await self._post(self.host, "/", {"method": "getDeviceList"})
+        _raise_for_error(envelope, "getDeviceList")
+        return (envelope.get("result") or {}).get("deviceList") or []
+
+    async def _async_get_paged_device_list(
+        self, device_types: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """The Tapo app's paged device list."""
+        devices: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        index = 0
+        for _ in range(_MAX_DEVICE_LIST_PAGES):
+            body = {
+                "deviceTypeList": list(device_types),
+                "index": index,
+                "limit": DEVICE_LIST_PAGE_SIZE,
+            }
+            envelope = await self._post(self.host, PATH_TAPO_DEVICE_LIST, body)
+            _raise_for_error(envelope, "getDeviceListByPage")
+            result = envelope.get("result") or {}
+            page = result.get("deviceList") or []
+            new_devices = [
+                device
+                for device in page
+                if device.get("deviceId") not in seen
+            ]
+            seen.update(device.get("deviceId") for device in new_devices)
+            devices.extend(new_devices)
+            index += len(page)
+            total = result.get("totalNum")
+            if (
+                not new_devices
+                or len(page) < DEVICE_LIST_PAGE_SIZE
+                or (isinstance(total, int) and index >= total)
+            ):
+                break
+        return devices
 
     async def async_passthrough(
         self, app_server_url: str, device_id: str, request_data: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Relay a command to a device over its cloud connection."""
-        if self.cloud_type == "tapo":
+        if self.cloud_type != "tapo":
             body: dict[str, Any] = {
-                "deviceId": device_id,
-                "requestData": json.dumps(request_data),
-            }
-            envelope = await self._post(app_server_url, PATH_TAPO_PASSTHROUGH, body)
-        else:
-            body = {
                 "method": "passthrough",
                 "params": {
                     "deviceId": device_id,
@@ -327,18 +524,56 @@ class TPLinkCloud:
                 },
             }
             envelope = await self._post(app_server_url, "/", body)
+            return self._passthrough_result(envelope)
 
-        error_code = envelope.get("error_code")
-        if error_code == ERR_TOKEN_EXPIRED:
-            raise TPLinkTokenExpiredError("Auth token expired", error_code=error_code)
-        if error_code != 0:
-            raise TPLinkCloudError(
-                envelope.get("msg") or f"passthrough failed ({error_code})",
-                error_code=error_code,
-            )
+        failures: list[str] = []
+        for mode in _ordered(_TAPO_PASSTHROUGH_MODES, self.passthrough_mode):
+            try:
+                if mode == PASSTHROUGH_V1_OBJECT:
+                    body = {
+                        "method": "passthrough",
+                        "params": {"deviceId": device_id, "requestData": request_data},
+                    }
+                    envelope = await self._post(app_server_url, "/", body)
+                else:
+                    body = {
+                        "deviceId": device_id,
+                        "requestData": request_data
+                        if mode == PASSTHROUGH_V2_OBJECT
+                        else json.dumps(request_data),
+                    }
+                    envelope = await self._post(
+                        app_server_url, PATH_TAPO_PASSTHROUGH, body
+                    )
+                result = self._passthrough_result(envelope)
+            except TPLinkUnsupportedRequestError as err:
+                failures.append(f"{mode}: {err}")
+                continue
+            if mode != self.passthrough_mode:
+                _LOGGER.debug("Tapo cloud accepted the %s passthrough request", mode)
+                self.passthrough_mode = mode
+            return result
+        raise TPLinkUnsupportedRequestError(
+            "Tapo cloud rejected every passthrough request ("
+            + "; ".join(failures)
+            + ")"
+        )
+
+    @staticmethod
+    def _passthrough_result(envelope: dict[str, Any]) -> dict[str, Any] | None:
+        _raise_for_error(envelope, "passthrough")
         response_data = (envelope.get("result") or {}).get("responseData")
         if isinstance(response_data, str):
-            return json.loads(response_data)
+            response_data = json.loads(response_data)
+        if (
+            isinstance(response_data, dict)
+            and response_data.get("error_code") == ERR_DEVICE_MALFORMED_REQUEST
+        ):
+            raise TPLinkUnsupportedRequestError(
+                "Device could not parse the relayed request "
+                f"({ERR_DEVICE_MALFORMED_REQUEST})",
+                error_code=ERR_DEVICE_MALFORMED_REQUEST,
+            )
         return response_data
 
 
@@ -358,6 +593,10 @@ class TPLinkCloudBridge:
         self.kasa = TPLinkCloud(session, ssl_context, "kasa", term_id)
         self.tapo = TPLinkCloud(session, ssl_context, "tapo", term_id)
         self._lock = asyncio.Lock()
+        # Cloud that last answered a request, per device id.
+        self._device_routes: dict[str, str] = {}
+        self._tapo_host_checked = False
+        self._tapo_list_error: str | None = None
 
     def cloud_for(self, cloud_type: str) -> TPLinkCloud:
         return self.tapo if cloud_type == "tapo" else self.kasa
@@ -389,54 +628,185 @@ class TPLinkCloudBridge:
                 await self._async_ensure_login(cloud)
             return await coro_factory()
 
+    async def _async_get_tapo_device_list(self) -> list[dict[str, Any]]:
+        """Tapo device list, moving off a stale stored app server once.
+
+        Entries set up before appServerUrlV2 was preferred keep the legacy
+        Tapo host in their config data; if that host serves no device list,
+        ask the cloud which server the account belongs on and retry there.
+        """
+        try:
+            return await self._async_call(self.tapo, self.tapo.async_get_device_list)
+        except TPLinkUnsupportedRequestError:
+            if self._tapo_host_checked:
+                raise
+            self._tapo_host_checked = True
+            old_host = self.tapo.host
+            try:
+                new_host = await self.tapo.async_lookup_host(self.username)
+            except TPLinkCloudError:
+                new_host = old_host
+            if not new_host or new_host == old_host:
+                raise
+            _LOGGER.debug("Retrying the Tapo device list on the account's V2 server")
+            self.tapo.host = new_host
+            try:
+                return await self._async_call(
+                    self.tapo, self.tapo.async_get_device_list
+                )
+            except TPLinkCloudError:
+                self.tapo.host = old_host
+                raise
+
     async def async_get_devices(self) -> list[dict[str, Any]]:
         """Merged device list from both clouds.
 
-        Each device dict gains a "cloud_type" key. Devices present in both
-        clouds keep the Kasa entry (V1 passthrough is the older, most
-        battle-tested path).
+        Each device dict gains a "cloud_type" key. A device listed by both
+        clouds keeps the entry of the cloud it is actually connected to:
+        the Kasa cloud lists Tapo devices too, but always as offline.
         """
-        devices: list[dict[str, Any]] = []
+        kasa_devices: list[dict[str, Any]] = []
+        tapo_devices: list[dict[str, Any]] = []
         try:
             kasa_devices = await self._async_call(
                 self.kasa, lambda: self.kasa.async_get_device_list()
             )
-            for device in kasa_devices:
-                device["cloud_type"] = "kasa"
-                devices.append(device)
         except (TPLinkAuthError, TPLinkMFARequiredError):
             raise
         except TPLinkCloudError as err:
             _LOGGER.warning("Kasa cloud device list failed: %s", err)
 
         try:
-            tapo_devices = await self._async_call(
-                self.tapo, lambda: self.tapo.async_get_device_list()
-            )
-            known_ids = {device.get("deviceId") for device in devices}
-            for device in tapo_devices:
-                if device.get("deviceId") not in known_ids:
-                    device["cloud_type"] = "tapo"
-                    devices.append(device)
+            tapo_devices = await self._async_get_tapo_device_list()
         except (TPLinkAuthError, TPLinkMFARequiredError):
             # The Tapo cloud rejects accounts that have never used the Tapo
             # app; that must not break Kasa-only setups.
-            if not devices:
+            if not kasa_devices:
                 raise
             _LOGGER.debug("Tapo cloud login rejected; continuing with Kasa only")
         except TPLinkCloudError as err:
-            _LOGGER.warning("Tapo cloud device list failed: %s", err)
+            message = str(err)
+            if message != self._tapo_list_error:
+                _LOGGER.warning(
+                    "Tapo cloud device list failed: %s. Tapo devices listed by "
+                    "the Kasa cloud are still tried through the Tapo cloud",
+                    message,
+                )
+            else:
+                _LOGGER.debug("Tapo cloud device list failed: %s", message)
+            self._tapo_list_error = message
+        else:
+            self._tapo_list_error = None
 
-        return devices
+        return _merge_device_lists(kasa_devices, tapo_devices)
+
+    def _routes(self, device: dict[str, Any]) -> list[str]:
+        """Clouds to try for a device, best first."""
+        primary = device.get("cloud_type") or "kasa"
+        routes = [primary]
+        if primary != "tapo" and is_tapo_family(device):
+            # Only listed by the Kasa cloud (e.g. the Tapo device list
+            # failed): the Tapo cloud is where the device is connected,
+            # unless the Kasa cloud says otherwise.
+            if device.get("status") == _STATUS_ONLINE:
+                routes.append("tapo")
+            else:
+                routes.insert(0, "tapo")
+        known = self._device_routes.get(device.get("deviceId", ""))
+        if known in routes:
+            routes.remove(known)
+            routes.insert(0, known)
+        return routes
+
+    def _server_url(self, device: dict[str, Any], cloud: TPLinkCloud) -> str:
+        """App server to relay a device's passthrough through."""
+        listed_by = device.get("cloud_type") or "kasa"
+        if cloud.cloud_type == "tapo":
+            if device.get("appServerUrlV2"):
+                return device["appServerUrlV2"]
+            if listed_by == "tapo" and device.get("appServerUrl"):
+                return device["appServerUrl"]
+            return cloud.host
+        if listed_by == "kasa" and device.get("appServerUrl"):
+            return device["appServerUrl"]
+        return cloud.host
 
     async def async_device_request(
         self, device: dict[str, Any], request_data: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Send a passthrough command to a device from the merged list."""
-        cloud = self.cloud_for(device.get("cloud_type", "kasa"))
-        app_server_url = device.get("appServerUrl") or cloud.host
         device_id = device["deviceId"]
-        return await self._async_call(
-            cloud,
-            lambda: cloud.async_passthrough(app_server_url, device_id, request_data),
+        routes = self._routes(device)
+        errors: list[tuple[str, TPLinkCloudError]] = []
+        for cloud_type in routes:
+            cloud = self.cloud_for(cloud_type)
+            app_server_url = self._server_url(device, cloud)
+            try:
+                response = await self._async_call(
+                    cloud,
+                    lambda cloud=cloud, url=app_server_url: cloud.async_passthrough(
+                        url, device_id, request_data
+                    ),
+                )
+            except TPLinkCloudError as err:
+                errors.append((cloud_type, err))
+                continue
+            self._device_routes[device_id] = cloud_type
+            return response
+
+        if len(errors) == 1:
+            raise errors[0][1]
+        non_auth = [
+            err
+            for _, err in errors
+            if not isinstance(err, (TPLinkAuthError, TPLinkMFARequiredError))
+        ]
+        if not non_auth:
+            raise errors[0][1]
+        error_class = (
+            TPLinkDeviceOfflineError
+            if all(isinstance(err, TPLinkDeviceOfflineError) for err in non_auth)
+            else TPLinkCloudError
         )
+        raise error_class(
+            "; ".join(f"{cloud_type} cloud: {err}" for cloud_type, err in errors)
+        ) from errors[-1][1]
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Which request shapes each cloud accepted (no identifiers)."""
+        return {
+            "tapo_device_list_mode": self.tapo.device_list_mode,
+            "tapo_passthrough_mode": self.tapo.passthrough_mode,
+            "tapo_device_list_error": self._tapo_list_error,
+            "device_routes": sorted(self._device_routes.values()),
+        }
+
+
+def _merge_device_lists(
+    kasa_devices: list[dict[str, Any]], tapo_devices: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge both clouds' lists into one entry per device id.
+
+    For a device listed by both clouds, the entry whose cloud reports it
+    online wins; if both or neither do, Tapo-family devices keep the Tapo
+    entry and everything else the Kasa entry.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for cloud_type, devices in (("kasa", kasa_devices), ("tapo", tapo_devices)):
+        for device in devices:
+            device_id = device.get("deviceId")
+            if not device_id:
+                continue
+            device["cloud_type"] = cloud_type
+            existing = merged.get(device_id)
+            if existing is None or _prefer_tapo_entry(device, existing):
+                merged[device_id] = device
+    return list(merged.values())
+
+
+def _prefer_tapo_entry(tapo: dict[str, Any], kasa: dict[str, Any]) -> bool:
+    tapo_online = tapo.get("status") == _STATUS_ONLINE
+    kasa_online = kasa.get("status") == _STATUS_ONLINE
+    if tapo_online != kasa_online:
+        return tapo_online
+    return is_tapo_family(tapo) or is_tapo_family(kasa)

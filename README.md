@@ -67,10 +67,16 @@ TP-Link runs two parallel clouds for the same account:
 
 | | Kasa cloud | Tapo cloud |
 |---|---|---|
-| Endpoint | `n-wap.tplinkcloud.com` | `n-wap.i.tplinkcloud.com` |
+| Endpoint | `n-wap.tplinkcloud.com` → account's `appServerUrl` | `n-wap.i.tplinkcloud.com` → account's `appServerUrlV2` |
+| Device list | V1 `{"method":"getDeviceList"}` on `/` | V2 `POST /api/v2/common/getDeviceListByPage` (paged, by `deviceTypeList`) |
 | Passthrough | V1 `{"method":"passthrough"}` on `/` | V2 `POST /api/v2/common/passthrough` |
+| Device protocol | IOT (`get_sysinfo`, `set_relay_state`, …) | SMART (`get_device_info`, `set_device_info`) |
 
 Every request is HMAC-SHA1-signed with app-level keys (the same signing the official Android apps perform), and commands are relayed to the device over the device's own persistent cloud connection. Since the device authenticates *outward* to the cloud, the local TPAP lockout is irrelevant.
+
+The Kasa cloud also lists Tapo devices, but always as offline (status 0), because they are connected to the Tapo cloud instead. The integration therefore keeps the entry from the cloud a device is actually connected to, and relays Tapo devices through the Tapo cloud. If the Tapo device list cannot be fetched, Tapo devices the Kasa cloud lists are still relayed through the Tapo cloud. A controllable device whose cloud reports it offline is still asked for its state, at most every 5 minutes after a failed attempt, so a wrong cloud status no longer hides a working device.
+
+Neither cloud API is documented, so the Tapo device-list and passthrough requests are tried in a few known shapes, and the one the cloud accepts is remembered. The integration's diagnostics download shows which shapes were accepted, under `cloud`.
 
 The cloud endpoints present certificates from TP-Link's private CA, which is bundled with the integration.
 
@@ -87,7 +93,9 @@ Protocol details were derived from the excellent GPL-3.0 [piekstra/tplink-cloud-
 
 - Cloud polling: state changes made outside HA can take up to one polling interval to appear.
 - Requires an internet connection and TP-Link's cloud to be up.
-- Bulb color/color-temperature support depends on the device exposing the Kasa lighting service through the cloud; Tapo bulbs may be limited to on/off.
+- Kasa bulbs get color/color temperature when they expose the Kasa lighting service through the cloud. Tapo bulbs get brightness, color and color temperature from `get_device_info`, but no transitions.
+- Tapo energy-monitoring plugs (P110/P115, …) report current power only.
+- Tapo power strips (P300, P304) are exposed as one switch; per-outlet control is not supported yet.
 - Hubs, sensors, cameras, and vacuums are presence-only (connectivity sensor, no control).
 - TP-Link could change the cloud API at any time; this is an unofficial client.
 

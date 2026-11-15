@@ -26,6 +26,8 @@ REDACT_ENTRY = {
 REDACT_DEVICE = {
     "deviceId",
     "deviceMac",
+    "appServerUrl",
+    "appServerUrlV2",
     "hwId",
     "fwId",
     "oemId",
@@ -39,6 +41,11 @@ REDACT_DEVICE = {
     "fw_id",
     "oem_id",
     "dev_name",
+    # SMART-protocol get_device_info fields
+    "device_id",
+    "nickname",
+    "ip",
+    "region",
 }
 
 
@@ -56,11 +63,14 @@ async def async_get_config_entry_diagnostics(
             "emeter": device.emeter,
             "emeter_supported": device.emeter_supported,
             "online": device.online,
+            "reachable": device.reachable,
+            "protocol": device.protocol,
         }
         for device in (coordinator.data or {}).values()
     ]
     return {
         "entry": async_redact_data(dict(entry.data), REDACT_ENTRY),
         "options": dict(entry.options),
+        "cloud": coordinator.bridge.diagnostics(),
         "devices": devices,
     }

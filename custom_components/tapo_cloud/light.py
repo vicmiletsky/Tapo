@@ -19,8 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, LIGHT_DEVICE_TYPES, base_model
 from .coordinator import TapoCloudCoordinator
 from .entity import TapoCloudEntity
-
-LIGHT_SERVICE = "smartlife.iot.smartbulb.lightingservice"
+from .smart import LIGHT_SERVICE, PROTOCOL_SMART
 
 DEFAULT_MIN_KELVIN = 2500
 DEFAULT_MAX_KELVIN = 6500
@@ -58,7 +57,9 @@ class TapoCloudLight(TapoCloudEntity, LightEntity):
     Bulbs whose sysinfo exposes the Kasa lighting service (light_state)
     get brightness/color/color-temperature support according to their
     capability flags; anything else falls back to plain on/off through
-    the relay, which the cloud passthrough accepts for Tapo bulbs too.
+    the relay. Tapo (SMART protocol) bulbs report the same shape: the
+    coordinator normalizes their get_device_info and translates these
+    commands to set_device_info.
     """
 
     _attr_name = None
@@ -120,16 +121,28 @@ class TapoCloudLight(TapoCloudEntity, LightEntity):
 
     @property
     def supported_features(self) -> LightEntityFeature:
+        device = self.device
+        # set_device_info (SMART protocol) has no transition parameter.
+        if device and device.protocol == PROTOCOL_SMART:
+            return LightEntityFeature(0)
         if self._light_state() is not None:
             return LightEntityFeature.TRANSITION
         return LightEntityFeature(0)
 
+    def _reported_kelvin_range(self) -> list[int] | None:
+        temp_range = (self._sysinfo() or {}).get("color_temp_range")
+        return temp_range if isinstance(temp_range, list) else None
+
     @property
     def min_color_temp_kelvin(self) -> int:
+        if temp_range := self._reported_kelvin_range():
+            return temp_range[0]
         return DEFAULT_MIN_KELVIN
 
     @property
     def max_color_temp_kelvin(self) -> int:
+        if temp_range := self._reported_kelvin_range():
+            return temp_range[1]
         device = self.device
         if device and base_model(device.model).startswith(WIDE_KELVIN_MODEL_PREFIXES):
             return WIDE_MAX_KELVIN
