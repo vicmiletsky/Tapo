@@ -67,6 +67,8 @@ Copy `custom_components/tapo_cloud` into your Home Assistant `config/custom_comp
 2. Sign in with your TP-Link account (the one you use in the Tapo/Kasa app).
 3. If your account has two-step verification, you'll be prompted for the code TP-Link emails you — once per cloud (Kasa and Tapo are separate clouds behind the same account).
 
+The Tapo cloud may also ask for an emailed code when a new installation signs in. Installations set up before this was handled show **Re-authentication required** under Settings → Devices & Services; re-enter your password and the code TP-Link emails you.
+
 All devices registered to the account are discovered automatically. The polling interval is adjustable under the integration's **Configure** option (15–600 seconds).
 
 ## How it works

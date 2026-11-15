@@ -407,3 +407,124 @@ async def test_stale_tapo_host_is_restored_if_the_new_one_fails_too() -> None:
     # Only looked up once per session.
     await bridge.async_get_devices()
     bridge.tapo.async_lookup_host.assert_awaited_once()
+
+
+# ---- Tapo login that asks for an emailed code (Tapo #1) ---------------------
+
+from custom_components.tapo_cloud.api import (  # noqa: E402
+    PATH_LOGIN,
+    PATH_MFA_LOGIN,
+    PATH_SEND_MFA_EMAIL,
+    TPLinkAuthError,
+    TPLinkMFARequiredError,
+)
+
+
+async def test_tapo_login_without_token_but_mfa_process_needs_a_code() -> None:
+    """error_code 0 with an mfaProcessId and no token is an MFA challenge.
+
+    Treating it as success left the token empty, and every later request
+    was answered with -20104 "Parameter doesn't exist".
+    """
+    tapo = _cloud()
+    tapo.token = None
+
+    def handler(base_url, url_path, body):
+        if url_path == PATH_LOGIN:
+            return {"error_code": 0, "result": {"mfaProcessId": "proc-1", "mfaType": 1}}
+        return {"error_code": 0, "result": {"appServerUrlV2": TAPO_HOST}}
+
+    FakeCloud(tapo, handler)
+    with pytest.raises(TPLinkMFARequiredError) as err:
+        await tapo.async_login("user", "password")
+    assert err.value.mfa_process_id == "proc-1"
+    assert tapo.mfa_process_id == "proc-1"
+    assert tapo.token is None
+
+
+async def test_login_without_token_or_mfa_process_fails() -> None:
+    tapo = _cloud()
+    tapo.token = None
+
+    def handler(base_url, url_path, body):
+        if url_path == PATH_LOGIN:
+            return {"error_code": 0, "result": {}}
+        return {"error_code": 0, "result": {"appServerUrlV2": TAPO_HOST}}
+
+    FakeCloud(tapo, handler)
+    with pytest.raises(TPLinkCloudError, match="no token"):
+        await tapo.async_login("user", "password")
+    assert tapo.token is None
+
+
+async def test_tapo_mfa_code_is_requested_and_verified() -> None:
+    tapo = _cloud()
+    tapo.token = None
+    tapo.mfa_process_id = "proc-1"
+
+    def handler(base_url, url_path, body):
+        if url_path == PATH_SEND_MFA_EMAIL:
+            return {"error_code": 0, "result": {}}
+        assert url_path == PATH_MFA_LOGIN
+        if body["code"] != "123456":
+            return {"error_code": -20607, "msg": "Wrong code"}
+        return {"error_code": 0, "result": {"token": "tok", "refreshToken": "ref"}}
+
+    fake = FakeCloud(tapo, handler)
+    await tapo.async_send_mfa_code("user", "password")
+    assert fake.calls[0][1:] == (
+        PATH_SEND_MFA_EMAIL,
+        {
+            "appType": "TP-Link_Tapo_Android",
+            "cloudUserName": "user",
+            "cloudPassword": "password",
+            "terminalUUID": "term-id",
+            "locale": "en_US",
+        },
+    )
+
+    with pytest.raises(TPLinkAuthError):
+        await tapo.async_verify_mfa("user", "password", "000000")
+    await tapo.async_verify_mfa("user", "password", "123456")
+
+    body = fake.calls[-1][2]
+    assert body["mfaProcessId"] == "proc-1"
+    assert body["terminalBindEnabled"] is True
+    assert (tapo.token, tapo.refresh_token, tapo.mfa_process_id) == ("tok", "ref", None)
+
+
+async def test_legacy_mfa_challenge_is_unchanged() -> None:
+    kasa = _cloud("kasa")
+    kasa.token = None
+    fake = FakeCloud(
+        kasa, lambda *_: {"error_code": 0, "result": {"token": "tok"}}
+    )
+    await kasa.async_send_mfa_code("user", "password")  # no process: no request
+    assert fake.calls == []
+    await kasa.async_verify_mfa("user", "password", "123456")
+    assert fake.calls[0][2] == {
+        "appType": "Kasa_Android_Mix",
+        "cloudPassword": "password",
+        "cloudUserName": "user",
+        "code": "123456",
+        "terminalUUID": "term-id",
+    }
+
+
+async def test_tapo_mfa_during_polling_is_surfaced_even_with_kasa_devices() -> None:
+    bridge = _bridge()
+    bridge.kasa.async_get_device_list = AsyncMock(return_value=[{"deviceId": "x"}])
+    bridge.tapo.async_get_device_list = AsyncMock(
+        side_effect=TPLinkMFARequiredError("code needed", mfa_process_id="p")
+    )
+    with pytest.raises(TPLinkMFARequiredError):
+        await bridge.async_get_devices()
+
+
+async def test_tapo_login_rejection_still_keeps_kasa_only_accounts_working() -> None:
+    bridge = _bridge()
+    bridge.kasa.async_get_device_list = AsyncMock(return_value=[{"deviceId": "x"}])
+    bridge.tapo.async_get_device_list = AsyncMock(
+        side_effect=TPLinkAuthError("no Tapo account")
+    )
+    assert [d["deviceId"] for d in await bridge.async_get_devices()] == ["x"]

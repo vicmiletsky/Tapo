@@ -69,6 +69,7 @@ PATH_ACCOUNT_STATUS = "/api/v2/account/getAccountStatusAndUrl"
 PATH_LOGIN = "/api/v2/account/login"
 PATH_REFRESH = "/api/v2/account/refreshToken"
 PATH_MFA_LOGIN = "/api/v2/account/checkMFACodeAndLogin"
+PATH_SEND_MFA_EMAIL = "/api/v2/account/getEmailVC4TerminalMFA"
 PATH_TAPO_PASSTHROUGH = "/api/v2/common/passthrough"
 PATH_TAPO_DEVICE_LIST = "/api/v2/common/getDeviceListByPage"
 
@@ -168,9 +169,15 @@ class TPLinkAuthError(TPLinkCloudError):
 class TPLinkMFARequiredError(TPLinkCloudError):
     """Login requires a multi-factor verification code."""
 
-    def __init__(self, message: str, mfa_type: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        mfa_type: str | None = None,
+        mfa_process_id: str | None = None,
+    ) -> None:
         super().__init__(message, error_code=ERR_MFA_REQUIRED)
         self.mfa_type = mfa_type
+        self.mfa_process_id = mfa_process_id
 
 
 class TPLinkTokenExpiredError(TPLinkCloudError):
@@ -275,6 +282,9 @@ class TPLinkCloud:
 
         self.token: str | None = None
         self.refresh_token: str | None = None
+        # Set when a login answered with an MFA process instead of a token
+        # (the Tapo cloud does this for terminals it has not seen before).
+        self.mfa_process_id: str | None = None
         # Request shapes this cloud accepted (Tapo only).
         self.device_list_mode: str | None = None
         self.passthrough_mode: str | None = None
@@ -376,15 +386,48 @@ class TPLinkCloud:
         envelope = await self._post(self.host, PATH_LOGIN, body, with_token=False)
         self._handle_login_result(envelope)
 
-    async def async_verify_mfa(self, username: str, password: str, code: str) -> None:
-        """Complete a login challenged with MFA."""
+    async def async_send_mfa_code(self, username: str, password: str) -> None:
+        """Ask TP-Link to email the code for a pending MFA process.
+
+        Only needed when login answered with an mfaProcessId; the older
+        -20677 challenge sends its code by itself.
+        """
+        if not self.mfa_process_id:
+            return
         body = {
             "appType": self._app_type,
-            "cloudPassword": password,
             "cloudUserName": username,
-            "code": code,
+            "cloudPassword": password,
             "terminalUUID": self._term_id,
+            "locale": "en_US",
         }
+        envelope = await self._post(
+            self.host, PATH_SEND_MFA_EMAIL, body, with_token=False
+        )
+        _raise_for_error(envelope, "Sending the verification code")
+
+    async def async_verify_mfa(self, username: str, password: str, code: str) -> None:
+        """Complete a login challenged with MFA."""
+        if self.mfa_process_id:
+            # The Tapo app's terminal-MFA check; binding the terminal keeps
+            # later logins from this installation from asking again.
+            body: dict[str, Any] = {
+                "appType": self._app_type,
+                "cloudUserName": username,
+                "code": code,
+                "mfaProcessId": self.mfa_process_id,
+                "mfaType": 1,
+                "terminalBindEnabled": True,
+                "supportBindAccount": False,
+            }
+        else:
+            body = {
+                "appType": self._app_type,
+                "cloudPassword": password,
+                "cloudUserName": username,
+                "code": code,
+                "terminalUUID": self._term_id,
+            }
         envelope = await self._post(self.host, PATH_MFA_LOGIN, body, with_token=False)
         error_code = envelope.get("error_code")
         if error_code != 0:
@@ -392,14 +435,37 @@ class TPLinkCloud:
                 envelope.get("msg") or f"MFA verification failed ({error_code})",
                 error_code=error_code,
             )
-        self._store_tokens(envelope.get("result") or {})
+        result = envelope.get("result") or {}
+        if not result.get("token"):
+            raise TPLinkCloudError("MFA verification returned no token")
+        self.mfa_process_id = None
+        self._store_tokens(result)
 
     def _handle_login_result(self, envelope: dict[str, Any]) -> None:
         error_code = envelope.get("error_code")
         result = envelope.get("result") or {}
+        _LOGGER.debug(
+            "%s cloud login answered error_code %s with fields %s",
+            self.cloud_type,
+            error_code,
+            sorted(result),
+        )
         if error_code == 0:
-            self._store_tokens(result)
-            return
+            if result.get("token"):
+                self.mfa_process_id = None
+                self._store_tokens(result)
+                return
+            if result.get("mfaProcessId"):
+                # Not a failure code, but no token either: every request
+                # sent without one is answered with -20104 "Parameter
+                # doesn't exist" (Tapo #1).
+                self.mfa_process_id = result["mfaProcessId"]
+                raise TPLinkMFARequiredError(
+                    f"{self.cloud_type} cloud needs an emailed verification code",
+                    mfa_type=result.get("mfaType"),
+                    mfa_process_id=self.mfa_process_id,
+                )
+            raise TPLinkCloudError(f"{self.cloud_type} cloud login returned no token")
         if error_code == ERR_MFA_REQUIRED:
             raise TPLinkMFARequiredError(
                 "MFA verification required", mfa_type=result.get("mfaType")
@@ -678,7 +744,11 @@ class TPLinkCloudBridge:
 
         try:
             tapo_devices = await self._async_get_tapo_device_list()
-        except (TPLinkAuthError, TPLinkMFARequiredError):
+        except TPLinkMFARequiredError:
+            # The account does use the Tapo cloud, which wants a code:
+            # surface it (re-authentication) instead of hiding Tapo devices.
+            raise
+        except TPLinkAuthError:
             # The Tapo cloud rejects accounts that have never used the Tapo
             # app; that must not break Kasa-only setups.
             if not kasa_devices:
@@ -775,6 +845,8 @@ class TPLinkCloudBridge:
     def diagnostics(self) -> dict[str, Any]:
         """Which request shapes each cloud accepted (no identifiers)."""
         return {
+            "kasa_logged_in": bool(self.kasa.token),
+            "tapo_logged_in": bool(self.tapo.token),
             "tapo_device_list_mode": self.tapo.device_list_mode,
             "tapo_passthrough_mode": self.tapo.passthrough_mode,
             "tapo_device_list_error": self._tapo_list_error,

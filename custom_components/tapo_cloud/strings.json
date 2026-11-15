@@ -20,7 +20,8 @@
     "error": {
       "invalid_auth": "Invalid email or password",
       "invalid_mfa_code": "Invalid verification code",
-      "cannot_connect": "Could not reach the TP-Link cloud"
+      "cannot_connect": "Could not reach the TP-Link cloud",
+      "mfa_send_failed": "TP-Link could not send a verification code. Try signing in again."
     },
     "abort": {
       "already_configured": "This TP-Link account is already configured",
