@@ -1,4 +1,4 @@
-"""Constants for the Tapo & Kasa Cloud Bridge integration."""
+"""Constants for the VM Tapo Cloud Bridge integration."""
 from __future__ import annotations
 
 from homeassistant.const import Platform

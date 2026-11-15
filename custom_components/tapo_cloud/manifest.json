@@ -1,6 +1,6 @@
 {
   "domain": "tapo_cloud",
-  "name": "Tapo & Kasa Cloud Bridge",
+  "name": "VM Tapo Cloud Bridge",
   "codeowners": ["@HallyAus"],
   "config_flow": true,
   "dependencies": [],

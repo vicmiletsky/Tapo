@@ -1,6 +1,14 @@
-# Tapo & Kasa Cloud Bridge for Home Assistant
+# VM Tapo Cloud Bridge for Home Assistant
 
 A [HACS](https://hacs.xyz) custom integration that controls **TP-Link Tapo and Kasa devices through TP-Link's cloud** — the same channel the official apps use.
+
+## What this fork changes and why
+
+This fork addresses the upstream bug where Tapo devices stay unavailable ([HallyAus/Tapo#1](https://github.com/HallyAus/Tapo/issues/1)).
+The Kasa cloud lists Tapo devices as offline, and the integration trusted that copy.
+Tapo's cloud also needs different server addresses and request formats than Kasa's, which the integration did not use.
+Tapo devices also speak their own command set, not the Kasa commands the integration was sending.
+This fork reaches Tapo devices through the Tapo cloud, using Tapo's own formats, so they should work again.
 
 ## Why this exists
 
@@ -46,8 +54,8 @@ This gives you a live inventory of which devices the TPAP rollout has claimed so
 ### Via HACS (recommended)
 
 1. In HACS, open **⋮ → Custom repositories**.
-2. Add `https://github.com/HallyAus/Tapo` with category **Integration**.
-3. Install **Tapo & Kasa Cloud Bridge** and restart Home Assistant.
+2. Add `https://github.com/vicmiletsky/Tapo` with category **Integration**.
+3. Install **VM Tapo Cloud Bridge** and restart Home Assistant.
 
 ### Manual
 
@@ -55,7 +63,7 @@ Copy `custom_components/tapo_cloud` into your Home Assistant `config/custom_comp
 
 ## Setup
 
-1. Go to **Settings → Devices & Services → Add Integration** and search for **Tapo & Kasa Cloud Bridge**.
+1. Go to **Settings → Devices & Services → Add Integration** and search for **VM Tapo Cloud Bridge**.
 2. Sign in with your TP-Link account (the one you use in the Tapo/Kasa app).
 3. If your account has two-step verification, you'll be prompted for the code TP-Link emails you — once per cloud (Kasa and Tapo are separate clouds behind the same account).
 
