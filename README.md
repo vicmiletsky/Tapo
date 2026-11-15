@@ -117,3 +117,5 @@ Protocol details were derived from the excellent GPL-3.0 [piekstra/tplink-cloud-
 This project is licensed under the [GPL-3.0](LICENSE).
 
 *This is an unofficial project, not affiliated with TP-Link. Tapo and Kasa are trademarks of TP-Link Corporation.*
+
+*The Tapo icon and logo in `custom_components/tapo_cloud/brand/` are TP-Link trademarks, taken from Home Assistant's [brands repository](https://github.com/home-assistant/brands/tree/master/core_integrations/tplink_tapo). They are not covered by this project's GPL-3.0 licence.*
