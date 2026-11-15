@@ -61,6 +61,7 @@ MATTER_NATIVE_MODELS = {
     "P110M",
     "P125M",
     "P400M",
+    "P410M",
     "KP125M",
     "S505",
     "S505D",

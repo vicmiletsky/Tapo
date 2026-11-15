@@ -60,6 +60,12 @@
       },
       "total_energy": {
         "name": "Total energy"
+      },
+      "today_energy": {
+        "name": "Today's energy"
+      },
+      "month_energy": {
+        "name": "This month's energy"
       }
     }
   }

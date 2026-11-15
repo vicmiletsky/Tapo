@@ -71,6 +71,13 @@ def test_energy_is_converted_from_milliwatts() -> None:
     assert smart_energy_to_emeter({}) == {}
 
 
+def test_emeter_data_is_preferred_for_power() -> None:
+    assert smart_energy_to_emeter(
+        {"current_power": 1500, "today_energy": 0},
+        {"power_mw": 1600, "voltage_mv": 0, "current_ma": 0, "energy_wh": 0},
+    ) == {"power": 1.6, "voltage": 0.0, "current": 0.0, "total": 0.0, "today": 0.0}
+
+
 def test_color_temperature_command() -> None:
     request = {
         "smartlife.iot.smartbulb.lightingservice": {

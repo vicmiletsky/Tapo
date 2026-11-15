@@ -72,6 +72,7 @@ def _real_coordinator(bridge: MagicMock) -> TapoCloudCoordinator:
     coordinator._emeter_support = {}
     coordinator._protocols = {}
     coordinator._probe_after = {}
+    coordinator._emeter_data_support = {}
     return coordinator
 
 
@@ -233,8 +234,100 @@ async def test_smart_energy_reading() -> None:
 
     coordinator = _real_coordinator(_bridge([plug], responder))
     device = (await coordinator._async_update_data())["p110"]
-    assert device.emeter == {"power": 12.5}
+    # get_emeter_data answered without readings: power comes from usage.
+    assert device.emeter == {"power": 12.5, "today": 0.03}
     assert device.emeter_supported
+
+
+def _p410m(responder) -> tuple[TapoCloudCoordinator, MagicMock]:
+    plug = {
+        "deviceId": "p410",
+        "alias": _b64("Balcony"),
+        "deviceModel": "P410M(EU)",
+        "deviceType": "SMART.TAPOPLUG",
+        "status": 1,
+        "cloud_type": "tapo",
+    }
+    bridge = _bridge([plug], responder)
+    return _real_coordinator(bridge), bridge
+
+
+def _methods(bridge: MagicMock) -> list[str]:
+    return [
+        call.args[1].get("method", "iot")
+        for call in bridge.async_device_request.await_args_list
+    ]
+
+
+async def test_unlisted_tapo_plug_reports_full_energy_readings() -> None:
+    """P410M is not in the model list; the plug is asked anyway."""
+
+    def responder(info, request):
+        method = request.get("method")
+        if method == "get_energy_usage":
+            return _smart_ok(
+                {"current_power": 230000, "today_energy": 1250, "month_energy": 41000}
+            )
+        if method == "get_emeter_data":
+            return _smart_ok(
+                {"power_mw": 231500, "voltage_mv": 231200, "current_ma": 1003, "energy_wh": 98765}
+            )
+        return _smart_ok({"device_on": True})
+
+    coordinator, _ = _p410m(responder)
+    device = (await coordinator._async_update_data())["p410"]
+    assert device.emeter == {
+        "power": 231.5,
+        "voltage": 231.2,
+        "current": 1.003,
+        "total": 98.765,
+        "today": 1.25,
+        "month": 41.0,
+    }
+    assert device.emeter_supported
+
+
+async def test_plug_without_metering_is_asked_once() -> None:
+    def responder(info, request):
+        if request.get("method") == "get_device_info":
+            return _smart_ok({"device_on": True})
+        return {"error_code": -40106, "msg": "method not supported"}
+
+    coordinator, bridge = _p410m(responder)
+    device = (await coordinator._async_update_data())["p410"]
+    assert device.emeter is None and device.emeter_supported is False
+    assert _methods(bridge) == ["get_device_info", "get_energy_usage"]
+
+    bridge.async_device_request.reset_mock()
+    await coordinator._async_update_data()
+    assert _methods(bridge) == ["get_device_info"]
+
+
+async def test_cloud_hiccup_does_not_disable_energy_readings() -> None:
+    fail = [True]
+
+    def responder(info, request):
+        method = request.get("method")
+        if method == "get_device_info":
+            return _smart_ok({"device_on": True})
+        if fail[0]:
+            raise TPLinkCloudError("timeout")
+        if method == "get_energy_usage":
+            return _smart_ok({"current_power": 5000})
+        return {"error_code": -40106}
+
+    coordinator, bridge = _p410m(responder)
+    device = (await coordinator._async_update_data())["p410"]
+    assert not device.emeter_supported
+
+    fail[0] = False
+    device = (await coordinator._async_update_data())["p410"]
+    assert device.emeter == {"power": 5.0}
+
+    # get_emeter_data is unsupported on this plug: not asked again.
+    bridge.async_device_request.reset_mock()
+    await coordinator._async_update_data()
+    assert _methods(bridge) == ["get_device_info", "get_energy_usage"]
 
 
 def _with_device(device: CloudDevice, responder) -> TapoCloudCoordinator:

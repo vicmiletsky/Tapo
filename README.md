@@ -32,7 +32,7 @@ This has hit P100/P105/P110 plugs, P300 strips, wall switches, KH100 hubs, and m
 | Smart plugs & wall switches (P100/P105/P110/P115, HS1xx, HS2xx, KP1xx, KS2xx, …) | Switch |
 | Power strips (HS300, KP303, KP400, EP40, …) | One switch per outlet |
 | Bulbs (L510/L530, KL series, …) | Light (brightness, color, and color temperature where supported) |
-| Energy-monitoring devices (P110/P115, HS110, KP115/KP125, …) | Power, voltage, current, total energy sensors |
+| Energy-monitoring devices (P110/P115, P410M, HS110, KP115/KP125, …) | Power, voltage, current, total energy sensors; Tapo plugs also today's and this month's energy |
 | **Every device on the account** (incl. hubs, cameras, vacuums) | Cloud connectivity binary sensor |
 
 The integration also fires `tapo_cloud_device_offline` / `tapo_cloud_device_online` events on the Home Assistant event bus when a device drops off or rejoins the TP-Link cloud, so you can build automations that alert you the moment a firmware update knocks something out.
@@ -104,7 +104,7 @@ Protocol details were derived from the excellent GPL-3.0 [piekstra/tplink-cloud-
 - Cloud polling: state changes made outside HA can take up to one polling interval to appear.
 - Requires an internet connection and TP-Link's cloud to be up.
 - Kasa bulbs get color/color temperature when they expose the Kasa lighting service through the cloud. Tapo bulbs get brightness, color and color temperature from `get_device_info`, but no transitions.
-- Tapo energy-monitoring plugs (P110/P115, …) report current power only.
+- Tapo plugs report voltage, current and total energy only if their firmware answers `get_emeter_data`; otherwise current power and today's/this month's energy. Voltage and current sensors are disabled by default.
 - Tapo power strips (P300, P304) are exposed as one switch; per-outlet control is not supported yet.
 - Hubs, sensors, cameras, and vacuums are presence-only (connectivity sensor, no control).
 - TP-Link could change the cloud API at any time; this is an unofficial client.

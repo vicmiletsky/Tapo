@@ -40,6 +40,7 @@ from .const import (
 from .smart import (
     PROTOCOL_IOT,
     PROTOCOL_SMART,
+    SMART_EMETER_DATA_REQUEST,
     SMART_ENERGY_REQUEST,
     SMART_INFO_REQUEST,
     SmartDeviceError,
@@ -157,6 +158,7 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         self._emeter_support: dict[str, bool] = {}
         self._protocols: dict[str, str] = {}
         self._probe_after: dict[str, float] = {}
+        self._emeter_data_support: dict[str, bool] = {}
 
     async def _async_update_data(self) -> dict[str, CloudDevice]:
         probe_enabled = self.entry.options.get(CONF_LOCAL_PROBE, DEFAULT_LOCAL_PROBE)
@@ -298,26 +300,35 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
         """Fetch energy readings for devices that support them.
 
         Support is probed once per device: known energy-monitoring models,
-        or a sysinfo feature string containing ENE.
+        a sysinfo feature string containing ENE, or any SMART-protocol plug
+        (Tapo has too many metering models to list; one that is not
+        answers the first request with an error).
         """
         device_id = device.device_id
         supported = self._emeter_support.get(device_id)
         if supported is None:
             feature = (device.sysinfo or {}).get("feature") or ""
-            supported = "ENE" in feature or device.model.upper().startswith(
-                EMETER_MODEL_PREFIXES
+            supported = (
+                "ENE" in feature
+                or device.model.upper().startswith(EMETER_MODEL_PREFIXES)
+                or (
+                    device.protocol == PROTOCOL_SMART
+                    and device.device_type in SWITCH_DEVICE_TYPES
+                )
             )
         if not supported:
             device.emeter_supported = False
             return
+        transient_failure = False
         if device.protocol == PROTOCOL_SMART:
             try:
-                response = await self.bridge.async_device_request(
-                    device.info, SMART_ENERGY_REQUEST
-                )
-                realtime = smart_energy_to_emeter(smart_result(response)) or None
-            except (TPLinkCloudError, SmartDeviceError):
+                realtime = await self._async_fetch_smart_energy(device) or None
+            except SmartDeviceError:
                 realtime = None
+            except TPLinkCloudError:
+                # A cloud hiccup says nothing about the plug's metering.
+                realtime = None
+                transient_failure = True
         else:
             try:
                 response = await self.bridge.async_device_request(
@@ -339,7 +350,33 @@ class TapoCloudCoordinator(DataUpdateCoordinator[dict[str, CloudDevice]]):
             device.emeter_supported = True
         else:
             device.emeter_supported = False
-            self._emeter_support[device_id] = False
+            if not transient_failure:
+                self._emeter_support[device_id] = False
+
+    async def _async_fetch_smart_energy(self, device: CloudDevice) -> dict[str, Any]:
+        """get_energy_usage, plus get_emeter_data where the plug has it.
+
+        Raises SmartDeviceError when the plug has no energy monitoring.
+        """
+        device_id = device.device_id
+        usage = smart_result(
+            await self.bridge.async_device_request(device.info, SMART_ENERGY_REQUEST)
+        )
+        emeter_data: dict[str, Any] | None = None
+        if self._emeter_data_support.get(device_id) is not False:
+            try:
+                emeter_data = smart_result(
+                    await self.bridge.async_device_request(
+                        device.info, SMART_EMETER_DATA_REQUEST
+                    )
+                )
+            except SmartDeviceError:
+                self._emeter_data_support[device_id] = False
+            except TPLinkCloudError:
+                pass
+            else:
+                self._emeter_data_support[device_id] = True
+        return smart_energy_to_emeter(usage, emeter_data)
 
     def _fire_presence_events(self, devices: dict[str, CloudDevice]) -> None:
         """Fire events when devices join or drop off the TP-Link cloud."""

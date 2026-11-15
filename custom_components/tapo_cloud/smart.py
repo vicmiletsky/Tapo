@@ -22,6 +22,8 @@ LIGHT_SERVICE = "smartlife.iot.smartbulb.lightingservice"
 
 SMART_INFO_REQUEST: dict[str, Any] = {"method": "get_device_info"}
 SMART_ENERGY_REQUEST: dict[str, Any] = {"method": "get_energy_usage"}
+# Newer energy-monitoring plugs also report voltage/current/energy here.
+SMART_EMETER_DATA_REQUEST: dict[str, Any] = {"method": "get_emeter_data"}
 
 # deviceType prefixes whose aliases the cloud returns base64-encoded.
 _BASE64_ALIAS_TYPE_PREFIXES = ("SMART.TAPO", "SMART.IPCAMERA", "SMART.KASA")
@@ -115,12 +117,34 @@ def smart_info_to_sysinfo(info: dict[str, Any]) -> dict[str, Any]:
     return sysinfo
 
 
-def smart_energy_to_emeter(result: dict[str, Any]) -> dict[str, Any]:
-    """Normalize get_energy_usage (current_power in mW) to emeter units."""
-    current_power = result.get("current_power")
-    if isinstance(current_power, (int, float)):
-        return {"power": current_power / 1000}
-    return {}
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def smart_energy_to_emeter(
+    usage: dict[str, Any], emeter_data: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Normalize SMART energy readings to emeter units (W, V, A, kWh).
+
+    get_energy_usage: current_power (mW), today_energy/month_energy (Wh).
+    get_emeter_data: power_mw, voltage_mv, current_ma, energy_wh.
+    """
+    data = emeter_data or {}
+    normalized: dict[str, Any] = {}
+    if _number(data.get("power_mw")):
+        normalized["power"] = data["power_mw"] / 1000
+    elif _number(usage.get("current_power")):
+        normalized["power"] = usage["current_power"] / 1000
+    for key, source, values in (
+        ("voltage", "voltage_mv", data),
+        ("current", "current_ma", data),
+        ("total", "energy_wh", data),
+        ("today", "today_energy", usage),
+        ("month", "month_energy", usage),
+    ):
+        if _number(values.get(source)):
+            normalized[key] = values[source] / 1000
+    return normalized
 
 
 def iot_request_to_smart(request: dict[str, Any]) -> dict[str, Any]:

@@ -71,6 +71,26 @@ SENSOR_DESCRIPTIONS: tuple[TapoCloudSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         suggested_display_precision=3,
     ),
+    # Tapo plugs: counters that reset at midnight / on the 1st. Total
+    # increasing handles the resets, so these work in the Energy dashboard.
+    TapoCloudSensorDescription(
+        key="today_energy",
+        emeter_key="today",
+        translation_key="today_energy",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=3,
+    ),
+    TapoCloudSensorDescription(
+        key="month_energy",
+        emeter_key="month",
+        translation_key="month_energy",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=3,
+    ),
 )
 
 
